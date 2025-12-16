@@ -6,45 +6,52 @@ import heapq
 import casadi as ca
 import random
 from scipy.ndimage import gaussian_filter
+from scipy.signal import convolve2d
+import warnings
+warnings.filterwarnings('ignore')
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. SIMPLIFIED CONFIGURATION
 # ==========================================
 class Config:
-    WIDTH = 12.0
-    HEIGHT = 12.0
-    RESOLUTION = 0.2
+    WIDTH = 15.0
+    HEIGHT = 15.0
+    RESOLUTION = 0.5
     
-    ROBOT_WIDTH = 0.6
-    ROBOT_LENGTH = 0.6
+    ROBOT_WIDTH = 0.5
+    ROBOT_LENGTH = 0.5
     
-    # Adaptive Thresholds
-    SAFETY_DIST = 1.5
+    # Safety parameters
+    SAFETY_DIST = 0.8
     
-    # Standard NMPC Params
+    # NMPC Parameters
     DT = 0.1          
-    N = 8           # Reduced for faster computation
+    N = 8             # Shorter horizon for faster computation
     
-    SIM_TIME = 400
+    SIM_TIME = 800
     
-    # MANY DYNAMIC OBSTACLES
-    NUM_DYNAMIC_OBSTACLES = 12
-    OBSTACLE_RADIUS = 0.25
+    # Dynamic obstacles
+    NUM_DYNAMIC_OBSTACLES = 6
+    OBSTACLE_RADIUS = 0.35
     
-    # LOCAL COSTMAP PARAMETERS
-    LOCAL_MAP_SIZE = 4.0
-    LOCAL_MAP_RES = 0.15
-    INFLATION_RADIUS = 0.6
-    COSTMAP_MAX = 100.0
-    COSTMAP_GOAL_ATTRACTION = 50.0
+    # COSTMAP PARAMETERS
+    LOCAL_MAP_SIZE = 5.0
+    LOCAL_MAP_RES = 0.1
+    INFLATION_RADIUS = 0.8
+    COSTMAP_MAX = 50.0
+    COSTMAP_GOAL_ATTRACTION = 80.0
     
-    # INTEGRATED PLANNER PARAMETERS
-    NMPC_WEIGHT = 0.7
-    COSTMAP_WEIGHT = 0.3
-    BLEND_DISTANCE = 2.0
+    # DYNAMIC MODEL PARAMETERS
+    MASS = 1.5
+    INERTIA = 0.15
+    MAX_FORCE = 4.0
+    MAX_TORQUE = 2.5
+    
+    # Navigation parameters
+    GOAL_TOLERANCE = 0.5
 
 # ==========================================
-# 2. MAPPING & A* 
+# 2. MAPPING
 # ==========================================
 class OccupancyGrid:
     def __init__(self):
@@ -52,72 +59,51 @@ class OccupancyGrid:
         self.rows = int(Config.HEIGHT / Config.RESOLUTION)
         self.grid = np.zeros((self.rows, self.cols), dtype=int)
 
-    def generate_navigable_obstacles(self, num_obs=8):
-        """Generate obstacles that create a navigable environment"""
-        count = 0
+    def generate_structured_obstacles(self):
+        """Create a structured obstacle course"""
+        # Clear grid first
+        self.grid.fill(0)
         
-        # Create structured corridor walls
-        main_obstacles = [
-            # Left corridor wall (with gaps)
-            (int(4/Config.RESOLUTION), int(2/Config.RESOLUTION), 1, int(3/Config.RESOLUTION)),
-            (int(4/Config.RESOLUTION), int(7/Config.RESOLUTION), 1, int(3/Config.RESOLUTION)),
+        # Create a simple structure
+        obstacles = [
+            # Border walls (with openings)
+            (0, 0, 30, 1),      # Bottom wall
+            (0, 29, 30, 1),     # Top wall  
+            (0, 0, 1, 30),      # Left wall
+            (29, 0, 1, 30),     # Right wall
             
-            # Right corridor wall (with gaps)
-            (int(8/Config.RESOLUTION), int(2/Config.RESOLUTION), 1, int(3/Config.RESOLUTION)),
-            (int(8/Config.RESOLUTION), int(7/Config.RESOLUTION), 1, int(3/Config.RESOLUTION)),
-            
-            # Top obstacles
-            (int(2/Config.RESOLUTION), int(9/Config.RESOLUTION), 3, 1),
-            (int(7/Config.RESOLUTION), int(9/Config.RESOLUTION), 3, 1),
-            
-            # Bottom obstacles
-            (int(2/Config.RESOLUTION), int(3/Config.RESOLUTION), 3, 1),
-            (int(7/Config.RESOLUTION), int(3/Config.RESOLUTION), 3, 1),
+            # Simple obstacles
+            (10, 10, 2, 2),     # Left obstacle
+            (20, 10, 2, 2),     # Right obstacle
+            (15, 20, 2, 2),     # Top obstacle
         ]
         
-        for cx, cy, width, height in main_obstacles:
-            self.grid[cy:cy+height, cx:cx+width] = 1
-            count += 1
-        
-        # Add a few random obstacles (not blocking main corridors)
-        attempts = 0
-        while count < num_obs and attempts < 100:
-            cx = random.randint(2, self.cols-3)
-            cy = random.randint(2, self.rows-3)
-            width = random.randint(1, 2)
-            height = random.randint(1, 2)
+        for cx, cy, width, height in obstacles:
+            # Ensure within bounds
+            cx = max(0, min(cx, self.cols - 1))
+            cy = max(0, min(cy, self.rows - 1))
+            width = min(width, self.cols - cx)
+            height = min(height, self.rows - cy)
             
-            # Avoid central corridors
-            in_corridor = False
-            for i in range(width):
-                for j in range(height):
-                    grid_x = cx + i
-                    grid_y = cy + j
-                    world_x = grid_x * Config.RESOLUTION
-                    world_y = grid_y * Config.RESOLUTION
-                    
-                    # Check if in main corridors
-                    if (4 < world_x < 8 and (3 < world_y < 5 or 7 < world_y < 9)) or \
-                       (4 < world_y < 8 and (3 < world_x < 5 or 7 < world_x < 9)):
-                        in_corridor = True
-                        break
-            
-            if not in_corridor:
+            if width > 0 and height > 0:
                 self.grid[cy:cy+height, cx:cx+width] = 1
-                count += 1
-            attempts += 1
+        
+        # Create openings in border walls
+        self.grid[0, 14:16] = 0   # Bottom opening
+        self.grid[29, 14:16] = 0  # Top opening
+        self.grid[14:16, 0] = 0   # Left opening
+        self.grid[14:16, 29] = 0  # Right opening
+        
+        return len(obstacles)
 
 def a_star_search(start, goal, grid_obj):
     def heuristic(a, b): 
-        # Euclidean distance with tie-breaking
-        dx = abs(a[0] - b[0])
-        dy = abs(a[1] - b[1])
-        return np.sqrt(dx*dx + dy*dy) * 1.001
+        return np.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2) * 1.001
     
     s_node = (int(start[1]/Config.RESOLUTION), int(start[0]/Config.RESOLUTION))
     g_node = (int(goal[1]/Config.RESOLUTION), int(goal[0]/Config.RESOLUTION))
     
-    neighbors = [(0,1), (0,-1), (1,0), (-1,0), (1,1), (1,-1), (-1,1), (-1,-1)]
+    neighbors = [(0,1), (0,-1), (1,0), (-1,0)]
     close_set = set()
     came_from = {}
     gscore = {s_node: 0}
@@ -149,8 +135,7 @@ def a_star_search(start, goal, grid_obj):
             else: 
                 continue
             
-            move_cost = 1.0 if i == 0 or j == 0 else 1.414
-            tent_g = gscore[current] + move_cost
+            tent_g = gscore[current] + 1.0
             
             if neighbor in close_set and tent_g >= gscore.get(neighbor, 0):
                 continue
@@ -164,7 +149,7 @@ def a_star_search(start, goal, grid_obj):
     return np.array([])
 
 # ==========================================
-# 3. LOCAL COSTMAP CLASS
+# 3. SIMPLIFIED COSTMAP
 # ==========================================
 class LocalCostmap:
     def __init__(self):
@@ -175,47 +160,27 @@ class LocalCostmap:
         self.costmap = np.zeros((self.grid_size, self.grid_size))
         self.gradient_x = np.zeros((self.grid_size, self.grid_size))
         self.gradient_y = np.zeros((self.grid_size, self.grid_size))
-        self.inflation_kernel = self.create_inflation_kernel()
         
-    def create_inflation_kernel(self):
-        kernel_size = int(Config.INFLATION_RADIUS / self.res) * 2 + 1
-        kernel = np.zeros((kernel_size, kernel_size))
-        center = kernel_size // 2
-        
-        for i in range(kernel_size):
-            for j in range(kernel_size):
-                dist = np.sqrt(((i - center) * self.res)**2 + ((j - center) * self.res)**2)
-                if dist <= Config.INFLATION_RADIUS:
-                    kernel[i, j] = max(0, Config.COSTMAP_MAX * (1 - (dist / Config.INFLATION_RADIUS)**2))
-        return kernel
-    
     def update(self, robot_x, robot_y, robot_theta, goal_x, goal_y, 
                static_grid, dynamic_obstacles):
-        """
-        Update local costmap and compute gradient
-        """
-        # Reset costmap
         self.costmap = np.zeros((self.grid_size, self.grid_size))
         
-        # Get world coordinates for each cell
-        world_x = np.zeros((self.grid_size, self.grid_size))
-        world_y = np.zeros((self.grid_size, self.grid_size))
+        # Create local grid
+        xs = np.linspace(-self.size/2, self.size/2, self.grid_size)
+        ys = np.linspace(-self.size/2, self.size/2, self.grid_size)
+        local_x, local_y = np.meshgrid(xs, ys)
         
-        for i in range(self.grid_size):
-            for j in range(self.grid_size):
-                # Convert from robot-centric to world coordinates
-                local_x = (j - self.center_idx) * self.res
-                local_y = (i - self.center_idx) * self.res
-                
-                # Rotate to align with robot orientation
-                rot_x = local_x * np.cos(robot_theta) - local_y * np.sin(robot_theta)
-                rot_y = local_x * np.sin(robot_theta) + local_y * np.cos(robot_theta)
-                
-                world_x[i, j] = robot_x + rot_x
-                world_y[i, j] = robot_y + rot_y
+        # Rotate to world frame
+        world_x = robot_x + local_x * np.cos(robot_theta) - local_y * np.sin(robot_theta)
+        world_y = robot_y + local_x * np.sin(robot_theta) + local_y * np.cos(robot_theta)
         
-        # 1. Add static obstacles
-        static_cost_layer = np.zeros((self.grid_size, self.grid_size))
+        # 1. Goal attraction (strong)
+        goal_dist = np.sqrt((world_x - goal_x)**2 + (world_y - goal_y)**2)
+        goal_cost = -Config.COSTMAP_GOAL_ATTRACTION * (1 - goal_dist / self.size)
+        goal_cost = np.clip(goal_cost, -Config.COSTMAP_GOAL_ATTRACTION, 0)
+        self.costmap += goal_cost
+        
+        # 2. Static obstacles
         for i in range(self.grid_size):
             for j in range(self.grid_size):
                 wx, wy = world_x[i, j], world_y[i, j]
@@ -226,63 +191,45 @@ class LocalCostmap:
                     
                     if 0 <= gx < static_grid.cols and 0 <= gy < static_grid.rows:
                         if static_grid.grid[gy, gx] == 1:
-                            static_cost_layer[i, j] = Config.COSTMAP_MAX
+                            # High cost at obstacle, decreasing with distance
+                            dx = (i - self.center_idx) * self.res
+                            dy = (j - self.center_idx) * self.res
+                            dist = np.sqrt(dx**2 + dy**2)
+                            if dist < Config.INFLATION_RADIUS:
+                                cost = Config.COSTMAP_MAX * (1 - dist/Config.INFLATION_RADIUS)
+                                self.costmap[i, j] += cost
         
-        # Inflate static obstacles
-        from scipy.signal import convolve2d
-        inflated_static = convolve2d(static_cost_layer, self.inflation_kernel, 
-                                     mode='same', boundary='fill', fillvalue=0)
-        self.costmap += np.minimum(inflated_static, Config.COSTMAP_MAX)
-        
-        # 2. Add dynamic obstacles
-        dynamic_cost_layer = np.zeros((self.grid_size, self.grid_size))
+        # 3. Dynamic obstacles
         for obs in dynamic_obstacles:
-            dist_sq = (world_x - obs.x)**2 + (world_y - obs.y)**2
-            obs_cost = Config.COSTMAP_MAX * np.exp(-dist_sq / (Config.INFLATION_RADIUS**2))
-            dynamic_cost_layer += obs_cost
-        
-        self.costmap += np.minimum(dynamic_cost_layer, Config.COSTMAP_MAX)
-        
-        # 3. Add goal attraction (negative gradient)
-        goal_dist = np.sqrt((world_x - goal_x)**2 + (world_y - goal_y)**2)
-        max_attraction_dist = self.size / 2
-        
-        goal_attraction = np.zeros_like(goal_dist)
-        mask = goal_dist < max_attraction_dist
-        goal_attraction[mask] = Config.COSTMAP_GOAL_ATTRACTION * (1 - goal_dist[mask]/max_attraction_dist)
-        
-        self.costmap -= goal_attraction
-        
-        # Ensure non-negative
-        self.costmap = np.maximum(self.costmap, 0)
+            dist = np.sqrt((world_x - obs.x)**2 + (world_y - obs.y)**2)
+            obs_cost = Config.COSTMAP_MAX * np.exp(-dist / 0.5)
+            self.costmap += np.minimum(obs_cost, Config.COSTMAP_MAX)
         
         # Smooth and compute gradient
-        self.costmap = gaussian_filter(self.costmap, sigma=1.0)
-        self.gradient_y, self.gradient_x = np.gradient(self.costmap)
+        self.costmap = gaussian_filter(self.costmap, sigma=0.5)
+        self.gradient_y, self.gradient_x = np.gradient(-self.costmap)
         
         return world_x, world_y
     
     def get_gradient_force(self, robot_x, robot_y, robot_theta):
-        """
-        Get repulsive force from costmap gradient
-        """
-        # Find cell corresponding to robot position (center cell)
         center_i = self.center_idx
         center_j = self.center_idx
         
         # Get gradient at robot position
-        grad_x = -self.gradient_x[center_i, center_j]  # Negative gradient = repulsive force
-        grad_y = -self.gradient_y[center_i, center_j]
+        grad_x = self.gradient_x[center_i, center_j]
+        grad_y = self.gradient_y[center_i, center_j]
         
-        # Rotate gradient to world frame
+        # Normalize
+        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+        if grad_mag > 1e-6:
+            grad_x /= grad_mag
+            grad_y /= grad_mag
+        else:
+            grad_x, grad_y = 1.0, 0.0
+        
+        # Rotate to world frame
         force_x = grad_x * np.cos(robot_theta) - grad_y * np.sin(robot_theta)
         force_y = grad_x * np.sin(robot_theta) + grad_y * np.cos(robot_theta)
-        
-        # Normalize and scale
-        force_mag = np.sqrt(force_x**2 + force_y**2)
-        if force_mag > 0:
-            force_x = force_x / force_mag
-            force_y = force_y / force_mag
         
         return force_x, force_y
 
@@ -293,77 +240,34 @@ class DynamicObstacle:
     def __init__(self, x, y, vx, vy):
         self.x, self.y = x, y
         self.vx, self.vy = vx, vy
-        self.original_vx, self.original_vy = vx, vy
-        self.bounce_randomness = random.uniform(0.8, 1.2)
-        self.direction_change_timer = random.randint(30, 120)
-        self.timer = 0
+        self.radius = Config.OBSTACLE_RADIUS
         
     def update(self, dt):
-        self.timer += 1
-        
-        # Occasionally change direction
-        if self.timer >= self.direction_change_timer:
-            self.vx += random.uniform(-0.15, 0.15)
-            self.vy += random.uniform(-0.15, 0.15)
-            self.timer = 0
-            self.direction_change_timer = random.randint(30, 120)
-        
         self.x += self.vx * dt
         self.y += self.vy * dt
         
         # Bounce off boundaries
-        if self.x < Config.OBSTACLE_RADIUS:
-            self.x = Config.OBSTACLE_RADIUS
-            self.vx = abs(self.vx) * self.bounce_randomness
-        elif self.x > Config.WIDTH - Config.OBSTACLE_RADIUS:
-            self.x = Config.WIDTH - Config.OBSTACLE_RADIUS
-            self.vx = -abs(self.vx) * self.bounce_randomness
-            
-        if self.y < Config.OBSTACLE_RADIUS:
-            self.y = Config.OBSTACLE_RADIUS
-            self.vy = abs(self.vy) * self.bounce_randomness
-        elif self.y > Config.HEIGHT - Config.OBSTACLE_RADIUS:
-            self.y = Config.HEIGHT - Config.OBSTACLE_RADIUS
-            self.vy = -abs(self.vy) * self.bounce_randomness
-            
-        # Speed limits
-        speed = np.sqrt(self.vx**2 + self.vy**2)
-        max_speed = 0.5
-        
-        if speed > max_speed:
-            self.vx = self.vx * max_speed / speed
-            self.vy = self.vy * max_speed / speed
-        elif speed < 0.05:
-            self.vx = self.original_vx * 0.3
-            self.vy = self.original_vy * 0.3
+        margin = self.radius
+        if self.x < margin or self.x > Config.WIDTH - margin:
+            self.vx *= -1
+            self.x = np.clip(self.x, margin, Config.WIDTH - margin)
+        if self.y < margin or self.y > Config.HEIGHT - margin:
+            self.vy *= -1
+            self.y = np.clip(self.y, margin, Config.HEIGHT - margin)
 
-def create_navigable_dynamic_obstacles(num_obstacles):
-    """Create dynamic obstacles that don't completely block paths"""
+def create_dynamic_obstacles():
     obstacles = []
     
-    for i in range(num_obstacles):
-        # Divide map into zones
-        zone = i % 4
-        if zone == 0:  # Bottom-left
-            x = random.uniform(2, 5)
-            y = random.uniform(2, 5)
-        elif zone == 1:  # Bottom-right
-            x = random.uniform(7, 10)
-            y = random.uniform(2, 5)
-        elif zone == 2:  # Top-left
-            x = random.uniform(2, 5)
-            y = random.uniform(7, 10)
-        else:  # Top-right
-            x = random.uniform(7, 10)
-            y = random.uniform(7, 10)
-        
-        # Avoid start and goal areas
-        if np.sqrt((x-1.5)**2 + (y-1.5)**2) < 1.5 or np.sqrt((x-10.5)**2 + (y-10.5)**2) < 1.5:
-            x = random.uniform(3, 9)
-            y = random.uniform(3, 9)
-        
-        # Random velocity (slower)
-        speed = random.uniform(0.2, 0.4)
+    # Create obstacles away from the direct path
+    positions = [
+        (4.0, 8.0), (11.0, 8.0),
+        (4.0, 12.0), (11.0, 12.0),
+        (8.0, 5.0), (8.0, 15.0),
+    ]
+    
+    for x, y in positions[:Config.NUM_DYNAMIC_OBSTACLES]:
+        # Slow movements
+        speed = 0.1
         angle = random.uniform(0, 2*np.pi)
         vx = speed * np.cos(angle)
         vy = speed * np.sin(angle)
@@ -373,7 +277,7 @@ def create_navigable_dynamic_obstacles(num_obstacles):
     return obstacles
 
 # ==========================================
-# 5. INTEGRATED PLANNER (NMPC + Costmap) - FIXED
+# 5. FIXED NMPC PLANNER (NO CASADI IF-ELSE ERRORS)
 # ==========================================
 class IntegratedPlanner:
     def __init__(self):
@@ -381,259 +285,341 @@ class IntegratedPlanner:
         self.initialize_nmpc()
         
     def initialize_nmpc(self):
-        """Initialize the NMPC controller - FIXED VERSION"""
+        """Initialize NMPC without conditional statements that cause CasADi errors"""
         self.opti = ca.Opti()
         
-        # State: [x, y, theta]
-        self.X = self.opti.variable(3, Config.N + 1)
+        # State: [x, y, theta, vx, vy, omega]
+        self.X = self.opti.variable(6, Config.N + 1)
         
-        # Control: [vx, vy, omega]
+        # Control: [Fx, Fy, Tau]
         self.U = self.opti.variable(3, Config.N)
         
         # Parameters
-        self.P_init = self.opti.parameter(3)          # Initial state
-        self.P_goal = self.opti.parameter(3)          # Goal state
-        self.P_costmap_force = self.opti.parameter(2) # Costmap force [fx, fy]
-        self.P_v_limit = self.opti.parameter(1)       # Velocity limit
-        self.P_blend_weight = self.opti.parameter(1)  # NMPC vs Costmap blend
+        self.P_init = self.opti.parameter(6)
+        self.P_goal = self.opti.parameter(3)
+        self.P_costmap_force = self.opti.parameter(2)
+        self.P_max_force = self.opti.parameter(1)
         
-        # Closest obstacles for NMPC (for point-mass avoidance)
-        self.P_obs = self.opti.parameter(2, 5)
+        # Robot parameters
+        m = Config.MASS
+        I = Config.INERTIA
         
-        # Cost weights - FIXED: Use scalar weights instead of matrices for simplicity
-        Q_pos_xy = 10.0    # Position tracking weight for x,y
-        Q_pos_theta = 1.0  # Position tracking weight for theta
-        Q_vel_xy = 0.5     # Control effort weight for vx,vy
-        Q_vel_omega = 0.2  # Control effort weight for omega
-        Q_costmap = 2.0    # Costmap alignment weight
+        # Cost weights
+        Q_pos = ca.diag([50.0, 50.0, 5.0, 0.1, 0.1, 0.1])
+        R_force = ca.diag([0.02, 0.02, 0.05])
         
-        # Build cost function
         total_cost = 0
         
         for k in range(Config.N):
-            # 1. Goal tracking cost - SIMPLIFIED TO AVOID MATRIX MULTIPLICATION
-            state_error_xy = (self.X[0, k] - self.P_goal[0])**2 + (self.X[1, k] - self.P_goal[1])**2
-            state_error_theta = (self.X[2, k] - self.P_goal[2])**2
-            total_cost += Q_pos_xy * state_error_xy + Q_pos_theta * state_error_theta
+            # Goal tracking
+            state_error = self.X[:3, k] - self.P_goal
+            total_cost += ca.mtimes(state_error.T, ca.mtimes(Q_pos[:3, :3], state_error))
             
-            # 2. Control effort cost - SIMPLIFIED
-            control_effort_xy = self.U[0, k]**2 + self.U[1, k]**2
-            control_effort_omega = self.U[2, k]**2
-            total_cost += Q_vel_xy * control_effort_xy + Q_vel_omega * control_effort_omega
+            # Velocity penalty
+            vel_error = self.X[3:6, k]
+            total_cost += ca.mtimes(vel_error.T, ca.mtimes(Q_pos[3:, 3:], vel_error))
             
-            # 3. Costmap alignment cost - SIMPLIFIED
-            # The costmap force points away from obstacles
-            desired_vx = self.P_costmap_force[0] * self.P_v_limit
-            desired_vy = self.P_costmap_force[1] * self.P_v_limit
+            # Control effort
+            control_effort = self.U[:, k]
+            total_cost += ca.mtimes(control_effort.T, ca.mtimes(R_force, control_effort))
             
-            costmap_error = (self.U[0, k] - desired_vx)**2 + (self.U[1, k] - desired_vy)**2
-            total_cost += self.P_blend_weight * Q_costmap * costmap_error
+            # Costmap following
+            theta = self.X[2, k]
+            desired_Fx = self.P_costmap_force[0] * self.P_max_force
+            desired_Fy = self.P_costmap_force[1] * self.P_max_force
             
-            # 4. Obstacle avoidance cost (point-mass) - SIMPLIFIED
-            for j in range(5):
-                obs_x = self.P_obs[0, j]
-                obs_y = self.P_obs[1, j]
-                
-                # Skip invalid obstacles (negative values indicate no obstacle)
-                if obs_x < -50 or obs_y < -50:
-                    continue
-                
-                dist_sq = (self.X[0, k] - obs_x)**2 + (self.X[1, k] - obs_y)**2 + 0.1
-                total_cost += 50.0 / dist_sq
+            F_error_x = self.U[0, k] - desired_Fx
+            F_error_y = self.U[1, k] - desired_Fy
+            total_cost += 1.0 * (F_error_x**2 + F_error_y**2)
         
         self.opti.minimize(total_cost)
         
-        # Dynamics constraints
+        # DYNAMICS EQUATIONS
         for k in range(Config.N):
-            dx = self.U[0, k]*ca.cos(self.X[2, k]) - self.U[1, k]*ca.sin(self.X[2, k])
-            dy = self.U[0, k]*ca.sin(self.X[2, k]) + self.U[1, k]*ca.cos(self.X[2, k])
-            dth = self.U[2, k]
+            x = self.X[0, k]
+            y = self.X[1, k]
+            theta = self.X[2, k]
+            vx = self.X[3, k]
+            vy = self.X[4, k]
+            omega = self.X[5, k]
             
+            Fx = self.U[0, k]
+            Fy = self.U[1, k]
+            Tau = self.U[2, k]
+            
+            # Dynamic equations
+            ax_robot = Fx / m
+            ay_robot = Fy / m
+            alpha = Tau / I
+            
+            # Rotate to world frame
+            ax_world = ax_robot * ca.cos(theta) - ay_robot * ca.sin(theta)
+            ay_world = ax_robot * ca.sin(theta) + ay_robot * ca.cos(theta)
+            
+            # State derivatives
+            dx = vx
+            dy = vy
+            dtheta = omega
+            dvx = ax_world
+            dvy = ay_world
+            domega = alpha
+            
+            # Euler integration
+            state_dot = ca.vertcat(dx, dy, dtheta, dvx, dvy, domega)
             self.opti.subject_to(
-                self.X[:, k+1] == self.X[:, k] + ca.vertcat(dx, dy, dth) * Config.DT
+                self.X[:, k+1] == self.X[:, k] + state_dot * Config.DT
             )
             
             # Control constraints
-            self.opti.subject_to(self.opti.bounded(-self.P_v_limit, self.U[0, k], self.P_v_limit))
-            self.opti.subject_to(self.opti.bounded(-self.P_v_limit, self.U[1, k], self.P_v_limit))
-            self.opti.subject_to(self.opti.bounded(-1.2, self.U[2, k], 1.2))
+            self.opti.subject_to(self.opti.bounded(-Config.MAX_FORCE, self.U[0, k], Config.MAX_FORCE))
+            self.opti.subject_to(self.opti.bounded(-Config.MAX_FORCE, self.U[1, k], Config.MAX_FORCE))
+            self.opti.subject_to(self.opti.bounded(-Config.MAX_TORQUE, self.U[2, k], Config.MAX_TORQUE))
+            
+            # Velocity constraints
+            max_speed = 1.0
+            self.opti.subject_to(self.opti.bounded(-max_speed, self.X[3, k], max_speed))
+            self.opti.subject_to(self.opti.bounded(-max_speed, self.X[4, k], max_speed))
+            self.opti.subject_to(self.opti.bounded(-1.0, self.X[5, k], 1.0))
         
-        # Initial state constraint
+        # Initial state
         self.opti.subject_to(self.X[:, 0] == self.P_init)
         
         # Solver options
-        opts = {'ipopt.print_level': 0, 'print_time': 0, 'ipopt.sb': 'yes'}
+        opts = {'ipopt.print_level': 0, 'print_time': 0, 'ipopt.sb': 'yes',
+                'ipopt.max_iter': 50, 'ipopt.tol': 1e-2}
         self.opti.solver('ipopt', opts)
     
     def plan(self, robot_state, goal_state, dynamic_obstacles, static_grid, closest_obstacle_dist):
-        """
-        Integrated planning combining NMPC and costmap
-        """
-        # 1. Update costmap
+        # Update costmap
         world_x, world_y = self.costmap.update(
             robot_state[0], robot_state[1], robot_state[2],
             goal_state[0], goal_state[1], static_grid, dynamic_obstacles
         )
         
-        # 2. Get costmap gradient force
+        # Get gradient force
         costmap_fx, costmap_fy = self.costmap.get_gradient_force(
             robot_state[0], robot_state[1], robot_state[2]
         )
         
-        # 3. Adaptive parameters based on environment
-        if closest_obstacle_dist < 0.8:
-            v_limit = 0.3
-            blend_weight = 0.8  # More weight to costmap (safety)
+        # Adaptive control based on obstacle distance
+        current_speed = np.sqrt(robot_state[3]**2 + robot_state[4]**2)
+        
+        if closest_obstacle_dist < 0.5:
+            max_force = Config.MAX_FORCE * 0.3
             robot_color = 'red'
-        elif closest_obstacle_dist < Config.SAFETY_DIST:
-            v_limit = 0.6
-            blend_weight = 0.5  # Balanced
+            # Move perpendicular to obstacle if too close
+            if len(dynamic_obstacles) > 0:
+                closest = min(dynamic_obstacles, key=lambda o: np.sqrt((robot_state[0]-o.x)**2 + (robot_state[1]-o.y)**2))
+                dx = robot_state[0] - closest.x
+                dy = robot_state[1] - closest.y
+                dist = np.sqrt(dx**2 + dy**2)
+                if dist > 0:
+                    # Perpendicular direction
+                    costmap_fx = -dy / dist
+                    costmap_fy = dx / dist
+        elif closest_obstacle_dist < 0.8:
+            max_force = Config.MAX_FORCE * 0.5
             robot_color = 'orange'
         else:
-            v_limit = 1.2
-            blend_weight = 0.3  # More weight to NMPC (efficiency)
-            robot_color = 'blue'
+            max_force = Config.MAX_FORCE * 0.7
+            robot_color = 'green'
         
-        # 4. Get closest obstacles for NMPC point-mass avoidance
-        obs_positions = np.ones((2, 5)) * -100  # Initialize far away
+        # Prepare full state
+        if len(robot_state) < 6:
+            full_state = np.zeros(6)
+            full_state[:3] = robot_state[:3]
+            full_state[3:6] = 0.0
+        else:
+            full_state = robot_state
         
-        if dynamic_obstacles:
-            distances = []
-            for i, obs in enumerate(dynamic_obstacles):
-                dist = np.sqrt((robot_state[0] - obs.x)**2 + (robot_state[1] - obs.y)**2)
-                distances.append((dist, i))
-            
-            distances.sort(key=lambda x: x[0])
-            
-            for idx, (_, obs_idx) in enumerate(distances[:5]):
-                obs = dynamic_obstacles[obs_idx]
-                obs_positions[0, idx] = obs.x
-                obs_positions[1, idx] = obs.y
-        
-        # 5. Solve integrated NMPC
+        # Try to solve NMPC
         try:
-            # Set parameter values
-            self.opti.set_value(self.P_init, robot_state)
-            self.opti.set_value(self.P_goal, goal_state)
+            self.opti.set_value(self.P_init, full_state)
+            self.opti.set_value(self.P_goal, goal_state[:3])
             self.opti.set_value(self.P_costmap_force, [costmap_fx, costmap_fy])
-            self.opti.set_value(self.P_v_limit, v_limit)
-            self.opti.set_value(self.P_blend_weight, blend_weight)
-            self.opti.set_value(self.P_obs, obs_positions)
+            self.opti.set_value(self.P_max_force, max_force)
             
-            # Set initial guess
-            current_vx = v_limit * costmap_fx
-            current_vy = v_limit * costmap_fy
+            # Initial guess: move toward goal
+            initial_control = np.zeros((3, Config.N))
             
-            # Simple initial guess: move toward goal
-            goal_dir = np.arctan2(goal_state[1] - robot_state[1], goal_state[0] - robot_state[0])
-            theta_error = goal_dir - robot_state[2]
-            # Normalize angle difference
-            theta_error = np.arctan2(np.sin(theta_error), np.cos(theta_error))
+            # Calculate direction to goal
+            dx = goal_state[0] - robot_state[0]
+            dy = goal_state[1] - robot_state[1]
+            dist_to_goal = np.sqrt(dx**2 + dy**2)
             
-            self.opti.set_initial(self.X, np.tile(np.array(robot_state)[:, None], (1, Config.N+1)))
-            self.opti.set_initial(self.U, np.array([[current_vx], [current_vy], [theta_error * 0.5]]))
+            if dist_to_goal > 0.1:
+                goal_dir_x = dx / dist_to_goal
+                goal_dir_y = dy / dist_to_goal
+                
+                theta = robot_state[2]
+                Fx_goal = goal_dir_x * np.cos(theta) + goal_dir_y * np.sin(theta)
+                Fy_goal = -goal_dir_x * np.sin(theta) + goal_dir_y * np.cos(theta)
+                
+                initial_control[0, :] = max_force * 0.5 * Fx_goal
+                initial_control[1, :] = max_force * 0.5 * Fy_goal
             
-            # Solve
+            # Initial state guess
+            initial_state = np.zeros((6, Config.N + 1))
+            for k in range(Config.N + 1):
+                dt_k = Config.DT * k
+                initial_state[0, k] = full_state[0] + full_state[3] * dt_k
+                initial_state[1, k] = full_state[1] + full_state[4] * dt_k
+                initial_state[2, k] = full_state[2] + full_state[5] * dt_k
+                initial_state[3:, k] = full_state[3:]
+            
+            self.opti.set_initial(self.X, initial_state)
+            self.opti.set_initial(self.U, initial_control)
+            
             sol = self.opti.solve()
             control = sol.value(self.U[:, 0])
             
-            # Get predicted trajectory for visualization
+            # Convert to accelerations
+            ax_robot = control[0] / Config.MASS
+            ay_robot = control[1] / Config.MASS
+            alpha = control[2] / Config.INERTIA
+            
+            # Rotate to world frame
+            theta = robot_state[2]
+            ax_world = ax_robot * np.cos(theta) - ay_robot * np.sin(theta)
+            ay_world = ax_robot * np.sin(theta) + ay_robot * np.cos(theta)
+            
+            control_world = np.array([ax_world, ay_world, alpha])
             predicted_traj = sol.value(self.X)[:2, :].T
             
         except Exception as e:
-            # Fallback: simple gradient following
-            print(f"NMPC failed: {e}, using fallback")
-            control = np.array([
-                v_limit * costmap_fx,
-                v_limit * costmap_fy,
-                0.0
-            ])
+            # Simple fallback: move toward goal
+            print(f"NMPC failed: {str(e)[:50]}... Using fallback")
+            
+            # Calculate direction to goal
+            dx = goal_state[0] - robot_state[0]
+            dy = goal_state[1] - robot_state[1]
+            dist_to_goal = np.sqrt(dx**2 + dy**2)
+            
+            if dist_to_goal > 0.1:
+                goal_dir_x = dx / dist_to_goal
+                goal_dir_y = dy / dist_to_goal
+                
+                # Apply force toward goal
+                force_mag = max_force * 0.3
+                ax_robot = force_mag * goal_dir_x / Config.MASS
+                ay_robot = force_mag * goal_dir_y / Config.MASS
+                
+                theta = robot_state[2]
+                ax_world = ax_robot * np.cos(theta) - ay_robot * np.sin(theta)
+                ay_world = ax_robot * np.sin(theta) + ay_robot * np.cos(theta)
+            else:
+                ax_world, ay_world = 0, 0
+            
+            control_world = np.array([ax_world, ay_world, 0.0])
             predicted_traj = None
         
-        return control, robot_color, predicted_traj
+        return control_world, robot_color, predicted_traj
 
 # ==========================================
-# 6. SIMULATION WITH INTEGRATED PLANNER - SIMPLIFIED
+# 6. SIMULATION
 # ==========================================
 def run_simulation():
+    print("="*70)
+    print("SIMPLIFIED MECANUM NAVIGATION")
+    print("="*70)
+    
     # Setup
     grid = OccupancyGrid()
-    grid.generate_navigable_obstacles(8)
+    num_obstacles = grid.generate_structured_obstacles()
+    print(f"Generated {num_obstacles} obstacle groups")
     
-    start, goal = (1.5, 1.5), (10.5, 10.5)
+    # Start and goal
+    start = (1.0, 1.0)
+    goal = (14.0, 14.0)
     
-    # Find path for visualization only
+    # Find global path
     path = a_star_search(start, goal, grid)
     if len(path) == 0:
-        print("No path found!")
-        return
+        print("Warning: No global path found! Using straight line")
+        path = np.array([start, goal])
     
-    # Create dynamic obstacles
-    dyn_obs = create_navigable_dynamic_obstacles(Config.NUM_DYNAMIC_OBSTACLES)
+    # Create obstacles
+    dyn_obs = create_dynamic_obstacles()
     
-    # Initialize integrated planner
+    # Initialize planner
     planner = IntegratedPlanner()
     
-    # Initial robot state
-    true_state = np.array([start[0], start[1], np.pi/4])
+    # Initial state
+    true_state = np.array([start[0], start[1], np.pi/4, 0.0, 0.0, 0.0])
+    
+    # Stuck detection
+    stuck_counter = 0
+    last_positions = []
     
     # Simulation control
     simulation_running = False
     simulation_paused = False
     
-    # Visualization setup - SIMPLIFIED
-    fig = plt.figure(figsize=(14, 8))
+    # Setup visualization
+    fig = plt.figure(figsize=(16, 10))
     
     # Main map
-    ax_map = plt.subplot2grid((2, 3), (0, 0), rowspan=2, colspan=2)
+    ax_map = plt.subplot2grid((2, 2), (0, 0), rowspan=2, colspan=1)
     
-    # Local costmap
-    ax_costmap = plt.subplot2grid((2, 3), (0, 2))
-    
-    # Info panel
-    ax_info = plt.subplot2grid((2, 3), (1, 2))
-    ax_info.axis('off')
-    
-    # Map setup
-    ax_map.set_title("Integrated Planner: NMPC + Costmap (Press 's' to start/stop)")
+    # Plot obstacles
     ax_map.imshow(grid.grid, cmap='binary', origin='lower', 
-                  extent=[0, Config.WIDTH, 0, Config.HEIGHT], alpha=0.7)
-    ax_map.plot(path[:,0], path[:,1], 'g--', alpha=0.5, label='Global Path')
-    ax_map.plot(start[0], start[1], 'bo', markersize=12, label='Start')
-    ax_map.plot(goal[0], goal[1], 'r*', markersize=15, label='Goal')
+                  extent=[0, Config.WIDTH, 0, Config.HEIGHT], alpha=0.9)
+    
+    # Plot path
+    if len(path) > 0:
+        ax_map.plot(path[:,0], path[:,1], 'g--', alpha=0.7, linewidth=2, label='Path')
+    
+    # Start and goal
+    ax_map.plot(start[0], start[1], 'go', markersize=15, label='Start', markeredgecolor='black')
+    ax_map.plot(goal[0], goal[1], 'r*', markersize=20, label='Goal', markeredgecolor='black')
+    
+    # Goal region
+    goal_circle = patches.Circle((goal[0], goal[1]), Config.GOAL_TOLERANCE, fill=False, 
+                                 linestyle='--', edgecolor='red', alpha=0.5, linewidth=2)
+    ax_map.add_patch(goal_circle)
     
     # Robot
     robot_patch = patches.Rectangle((0,0), Config.ROBOT_WIDTH, Config.ROBOT_LENGTH, 
-                                    color='blue', alpha=0.8)
+                                    color='green', alpha=0.9, edgecolor='black')
     ax_map.add_patch(robot_patch)
+    
+    # Robot footprint
+    robot_footprint = patches.Circle((0,0), Config.ROBOT_WIDTH/2,
+                                     fill=False, linestyle=':', color='green', alpha=0.5)
+    ax_map.add_patch(robot_footprint)
     
     # Dynamic obstacles
     obs_patches = []
     for obs in dyn_obs:
         patch = patches.Circle((obs.x, obs.y), Config.OBSTACLE_RADIUS, 
-                              color='red', alpha=0.6)
+                              color='orange', alpha=0.5, edgecolor='darkred')
         obs_patches.append(patch)
         ax_map.add_patch(patch)
     
     # Predicted trajectory
-    predicted_line, = ax_map.plot([], [], 'y-', linewidth=2, alpha=0.6, label='Predicted')
+    predicted_line, = ax_map.plot([], [], 'y-', linewidth=2, alpha=0.8, label='Predicted')
     
+    ax_map.set_title("Mecanum Robot Navigation", fontsize=14, fontweight='bold')
     ax_map.legend(loc='upper right')
-    ax_map.set_xlim(0, Config.WIDTH)
-    ax_map.set_ylim(0, Config.HEIGHT)
+    ax_map.set_xlim(-0.5, Config.WIDTH + 0.5)
+    ax_map.set_ylim(-0.5, Config.HEIGHT + 0.5)
+    ax_map.set_aspect('equal')
+    ax_map.grid(True, alpha=0.3)
     
-    # Costmap visualization
+    # Costmap
+    ax_costmap = plt.subplot2grid((2, 2), (0, 1))
     costmap_img = ax_costmap.imshow(np.zeros((planner.costmap.grid_size, planner.costmap.grid_size)), 
                                     cmap='RdYlGn_r', origin='lower',
                                     extent=[-planner.costmap.size/2, planner.costmap.size/2, 
-                                            -planner.costmap.size/2, planner.costmap.size/2],
-                                    vmin=0, vmax=Config.COSTMAP_MAX)
-    ax_costmap.set_title("Local Costmap")
-    ax_costmap.set_xlabel("Local X")
-    ax_costmap.set_ylabel("Local Y")
+                                            -planner.costmap.size/2, planner.costmap.size/2])
+    ax_costmap.set_title("Local Costmap", fontweight='bold')
+    ax_costmap.set_xlabel("Local X (m)")
+    ax_costmap.set_ylabel("Local Y (m)")
+    plt.colorbar(costmap_img, ax=ax_costmap, label='Cost')
     
-    # Data storage
-    h_t = []
+    # Info panel
+    ax_info = plt.subplot2grid((2, 2), (1, 1))
+    ax_info.axis('off')
     
     # Metrics
     total_distance = 0
@@ -642,134 +628,233 @@ def run_simulation():
     success = False
     simulation_time = 0
     
-    def get_lookahead_point(path, robot_pos, lookahead=1.0):
-        """Get lookahead point on path"""
-        if len(path) < 2:
-            return path[-1] if len(path) > 0 else robot_pos[:2]
+    def get_current_waypoint(path, robot_pos, lookahead=2):
+        """Get the next waypoint along the path"""
+        if len(path) == 0:
+            return goal
         
         # Find closest point on path
         dists = np.linalg.norm(path - robot_pos[:2], axis=1)
         closest_idx = np.argmin(dists)
         
-        # Move forward along path
-        target_idx = min(closest_idx + 3, len(path)-1)
-        return np.array([path[target_idx][0], path[target_idx][1], 0.0])
+        # Look ahead a bit
+        lookahead_idx = min(closest_idx + 1, len(path)-1)
+        
+        return np.array([path[lookahead_idx][0], path[lookahead_idx][1], 0.0])
     
     def update(frame):
         nonlocal true_state, simulation_running, simulation_paused
         nonlocal total_distance, last_position, collision_count, success, simulation_time
+        nonlocal stuck_counter, last_positions
         
         if not simulation_running or simulation_paused:
-            # Don't update simulation
-            return_items = [robot_patch, costmap_img, predicted_line] + obs_patches
-            return return_items
+            return [robot_patch, robot_footprint, costmap_img, predicted_line] + obs_patches
         
-        # Increment simulation time
         simulation_time += Config.DT
         
-        # 1. Update dynamic obstacles
+        # Update dynamic obstacles
         for obs, patch in zip(dyn_obs, obs_patches):
             obs.update(Config.DT)
             patch.set_center((obs.x, obs.y))
         
-        # 2. Find closest obstacle
+        # Find closest obstacle distance
         min_dist = float('inf')
         for obs in dyn_obs:
             d = np.sqrt((true_state[0] - obs.x)**2 + (true_state[1] - obs.y)**2)
-            if d < min_dist:
-                min_dist = d
+            min_dist = min(min_dist, d)
+        
+        # Check collision with STATIC obstacles
+        robot_grid_x = int(true_state[0] / Config.RESOLUTION)
+        robot_grid_y = int(true_state[1] / Config.RESOLUTION)
+        
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                gx = robot_grid_x + dx
+                gy = robot_grid_y + dy
+                if 0 <= gx < grid.cols and 0 <= gy < grid.rows:
+                    if grid.grid[gy, gx] == 1:
+                        obs_x = gx * Config.RESOLUTION + Config.RESOLUTION/2
+                        obs_y = gy * Config.RESOLUTION + Config.RESOLUTION/2
+                        dist = np.sqrt((true_state[0] - obs_x)**2 + (true_state[1] - obs_y)**2)
+                        min_dist = min(min_dist, dist)
         
         # Check collision
-        if min_dist < Config.ROBOT_WIDTH/2 + Config.OBSTACLE_RADIUS:
+        collision_threshold = Config.ROBOT_WIDTH/2 + Config.OBSTACLE_RADIUS + 0.1
+        if min_dist < collision_threshold:
             collision_count += 1
         
-        # 3. Check if goal reached
+        # Stuck detection
+        current_speed = np.sqrt(true_state[3]**2 + true_state[4]**2)
+        last_positions.append(np.array([true_state[0], true_state[1]]))
+        if len(last_positions) > 20:
+            last_positions.pop(0)
+        
+        # Check if stuck
+        if len(last_positions) >= 20:
+            movement = np.linalg.norm(last_positions[-1] - last_positions[0])
+            if movement < 0.2 and current_speed < 0.1:
+                stuck_counter += 1
+                if stuck_counter > 30:
+                    print(f"🚨 Robot stuck! Applying escape...")
+                    # Push away from nearest obstacle
+                    if dyn_obs:
+                        closest = min(dyn_obs, key=lambda o: np.sqrt((true_state[0]-o.x)**2 + (true_state[1]-o.y)**2))
+                        dx = true_state[0] - closest.x
+                        dy = true_state[1] - closest.y
+                        dist = np.sqrt(dx**2 + dy**2)
+                        if dist > 0:
+                            true_state[3] += 0.5 * dx / dist
+                            true_state[4] += 0.5 * dy / dist
+                    stuck_counter = 0
+            else:
+                stuck_counter = max(0, stuck_counter - 1)
+        
+        # Check goal
         dist_to_goal = np.sqrt((true_state[0] - goal[0])**2 + (true_state[1] - goal[1])**2)
-        if dist_to_goal < 0.3 and not success:
+        
+        if dist_to_goal < Config.GOAL_TOLERANCE and not success:
             success = True
             simulation_running = False
-            print(f"\n🎉 GOAL REACHED! 🎉")
+            print("\n" + "="*60)
+            print("🎉 GOAL REACHED! 🎉")
             print(f"Time: {simulation_time:.1f}s")
             print(f"Distance: {total_distance:.1f}m")
-            print(f"Collisions: {collision_count}")
+            print(f"Collision warnings: {collision_count}")
+            print("="*60)
+            return [robot_patch, robot_footprint, costmap_img, predicted_line] + obs_patches
         
-        # 4. Get lookahead point for local goal
-        local_goal = get_lookahead_point(path, true_state)
+        # Get current waypoint
+        if len(path) > 0:
+            local_goal = get_current_waypoint(path, true_state)
+        else:
+            local_goal = np.array([goal[0], goal[1], 0.0])
         
-        # 5. Integrated planning
+        # Plan
         control, robot_color, predicted_traj = planner.plan(
             true_state, local_goal, dyn_obs, grid, min_dist
         )
         
-        # 6. Update distance traveled
+        # Update distance
         current_pos = np.array([true_state[0], true_state[1]])
         total_distance += np.linalg.norm(current_pos - last_position)
         last_position = current_pos.copy()
         
-        # 7. Update robot state
-        dx = control[0] * np.cos(true_state[2]) - control[1] * np.sin(true_state[2])
-        dy = control[0] * np.sin(true_state[2]) + control[1] * np.cos(true_state[2])
-        true_state += np.array([dx, dy, control[2]]) * Config.DT
+        # Apply control (with limits)
+        if not np.any(np.isnan(control)) and not np.any(np.isinf(control)):
+            # Update velocities
+            true_state[3] += control[0] * Config.DT
+            true_state[4] += control[1] * Config.DT
+            true_state[5] += control[2] * Config.DT
+            
+            # Velocity damping
+            true_state[3] *= 0.97
+            true_state[4] *= 0.97
+            true_state[5] *= 0.94
+            
+            # Limit velocities
+            max_speed = 0.6  # Slow but steady
+            current_speed = np.sqrt(true_state[3]**2 + true_state[4]**2)
+            if current_speed > max_speed:
+                true_state[3] *= max_speed / current_speed
+                true_state[4] *= max_speed / current_speed
+            
+            # Update position
+            true_state[0] += true_state[3] * Config.DT
+            true_state[1] += true_state[4] * Config.DT
+            true_state[2] += true_state[5] * Config.DT
         
         # Keep within bounds
-        true_state[0] = np.clip(true_state[0], Config.ROBOT_WIDTH/2, Config.WIDTH - Config.ROBOT_WIDTH/2)
-        true_state[1] = np.clip(true_state[1], Config.ROBOT_LENGTH/2, Config.HEIGHT - Config.ROBOT_LENGTH/2)
+        margin = Config.ROBOT_WIDTH/2 + 0.1
+        true_state[0] = np.clip(true_state[0], margin, Config.WIDTH - margin)
+        true_state[1] = np.clip(true_state[1], margin, Config.HEIGHT - margin)
         
-        # 8. Update robot visualization
-        cx, cy, th = true_state
+        # Update robot visualization
+        cx, cy, th = true_state[:3]
         w, l = Config.ROBOT_WIDTH, Config.ROBOT_LENGTH
+        
         corner_x = cx - (w/2)*np.cos(th) + (l/2)*np.sin(th)
         corner_y = cy - (w/2)*np.sin(th) - (l/2)*np.cos(th)
         robot_patch.set_xy((corner_x, corner_y))
         robot_patch.angle = np.degrees(th)
         robot_patch.set_color(robot_color)
         
-        # 9. Update predicted trajectory
+        # Update footprint
+        robot_footprint.center = (cx, cy)
+        
+        # Update predicted trajectory
         if predicted_traj is not None and len(predicted_traj) > 0:
             predicted_line.set_data(predicted_traj[:, 0], predicted_traj[:, 1])
         
-        # 10. Update info panel
+        # Update costmap
+        costmap_img.set_array(planner.costmap.costmap)
+        costmap_img.autoscale()
+        
+        # Update info panel
         ax_info.clear()
         ax_info.axis('off')
         
-        status_color = 'green' if success else ('red' if min_dist < 0.8 else 'blue')
-        status_text = "GOAL REACHED!" if success else "Running" if simulation_running else "Stopped"
+        y_pos = 0.95
+        # Status
+        if success:
+            status = "GOAL REACHED!"
+            status_color = 'green'
+        elif min_dist < 0.5:
+            status = "DANGER"
+            status_color = 'red'
+        elif min_dist < 0.8:
+            status = "CAUTION"
+            status_color = 'orange'
+        else:
+            status = "MOVING"
+            status_color = 'blue'
         
-        ax_info.text(0.1, 0.9, f"Status: {status_text}", 
-                    fontsize=12, fontweight='bold', color=status_color)
-        ax_info.text(0.1, 0.8, f"Closest Obstacle: {min_dist:.2f}m", 
-                    fontsize=10, color='red' if min_dist < 0.8 else 'black')
-        ax_info.text(0.1, 0.7, f"Goal Distance: {dist_to_goal:.2f}m", fontsize=10)
-        ax_info.text(0.1, 0.6, f"Distance Traveled: {total_distance:.1f}m", fontsize=10)
-        ax_info.text(0.1, 0.5, f"Collisions: {collision_count}", fontsize=10)
-        ax_info.text(0.1, 0.4, f"Time: {simulation_time:.1f}s", fontsize=10)
-        ax_info.text(0.1, 0.3, f"Controls:", fontsize=10, fontweight='bold')
-        ax_info.text(0.15, 0.25, "'s' - Start/Stop", fontsize=9)
-        ax_info.text(0.15, 0.20, "'r' - Reset", fontsize=9)
-        ax_info.text(0.15, 0.15, "'q' - Quit", fontsize=9)
+        ax_info.text(0.05, y_pos, f"Status: {status}", fontsize=14, 
+                    fontweight='bold', color=status_color)
+        y_pos -= 0.08
         
-        # Store time for graphs
-        h_t.append(simulation_time)
+        # Metrics
+        metrics = [
+            (f"Goal Distance: {dist_to_goal:.2f} m", 'black'),
+            (f"Closest Obstacle: {min_dist:.2f} m", 'red' if min_dist < 0.5 else 'orange' if min_dist < 0.8 else 'black'),
+            (f"Position: ({true_state[0]:.2f}, {true_state[1]:.2f})", 'black'),
+            (f"Heading: {np.degrees(true_state[2]):.0f}°", 'black'),
+            (f"Speed: {current_speed:.2f} m/s", 'green' if current_speed > 0.1 else 'orange'),
+            (f"Distance: {total_distance:.1f} m", 'black'),
+            (f"Time: {simulation_time:.1f} s", 'black'),
+            (f"Collisions: {collision_count}", 'red' if collision_count > 0 else 'black'),
+            ("", 'black'),
+            ("CONTROLS:", 'black', 'bold'),
+            ("  [S] - Start/Stop", 'black'),
+            ("  [P] - Pause/Resume", 'black'),
+            ("  [R] - Reset", 'black'),
+            ("  [Q] - Quit", 'black'),
+        ]
         
-        return_items = [robot_patch, costmap_img, predicted_line] + obs_patches
+        for text, color, *style in metrics:
+            if 'bold' in style:
+                ax_info.text(0.05, y_pos, text, fontsize=11, fontweight='bold', color=color)
+            else:
+                ax_info.text(0.05, y_pos, text, fontsize=11, color=color)
+            y_pos -= 0.06
         
-        return return_items
+        return [robot_patch, robot_footprint, costmap_img, predicted_line] + obs_patches
     
     def on_key(event):
         nonlocal simulation_running, simulation_paused, true_state, total_distance
-        nonlocal collision_count, success, simulation_time, last_position
+        nonlocal collision_count, success, simulation_time, last_position, dyn_obs, obs_patches
+        nonlocal stuck_counter, last_positions
         
-        if event.key == 's':  # Start/Stop
+        if event.key == 's' or event.key == 'S':
             simulation_running = not simulation_running
-            if simulation_running:
-                print("Simulation STARTED")
-                simulation_paused = False
-            else:
-                print("Simulation STOPPED")
+            print(f"Simulation {'STARTED' if simulation_running else 'STOPPED'}")
         
-        elif event.key == 'r':  # Reset
-            # Reset simulation
-            true_state = np.array([start[0], start[1], np.pi/4])
+        elif event.key == 'p' or event.key == 'P':
+            simulation_paused = not simulation_paused
+            print(f"Simulation {'PAUSED' if simulation_paused else 'RESUMED'}")
+        
+        elif event.key == 'r' or event.key == 'R':
+            # Reset
+            true_state = np.array([start[0], start[1], np.pi/4, 0.0, 0.0, 0.0])
             simulation_running = False
             simulation_paused = False
             total_distance = 0
@@ -777,43 +862,50 @@ def run_simulation():
             success = False
             simulation_time = 0
             last_position = np.array(start)
+            stuck_counter = 0
+            last_positions = []
             
-            # Reset robot position
-            cx, cy, th = true_state
+            # Reset robot
+            cx, cy, th = true_state[:3]
             w, l = Config.ROBOT_WIDTH, Config.ROBOT_LENGTH
             corner_x = cx - (w/2)*np.cos(th) + (l/2)*np.sin(th)
             corner_y = cy - (w/2)*np.sin(th) - (l/2)*np.cos(th)
             robot_patch.set_xy((corner_x, corner_y))
             robot_patch.angle = np.degrees(th)
-            robot_patch.set_color('blue')
+            robot_patch.set_color('green')
             
-            # Clear predicted trajectory
-            predicted_line.set_data([], [])
+            # Reset obstacles
+            for patch in obs_patches:
+                patch.remove()
+            obs_patches.clear()
+            
+            dyn_obs.clear()
+            dyn_obs.extend(create_dynamic_obstacles())
+            
+            for obs in dyn_obs:
+                patch = patches.Circle((obs.x, obs.y), Config.OBSTACLE_RADIUS, 
+                                      color='orange', alpha=0.5, edgecolor='darkred')
+                obs_patches.append(patch)
+                ax_map.add_patch(patch)
             
             print("Simulation RESET")
         
-        elif event.key == 'q':  # Quit
+        elif event.key == 'q' or event.key == 'Q':
             plt.close()
-            print("Quitting...")
+            print("Simulation terminated.")
     
-    # Connect keyboard events
     fig.canvas.mpl_connect('key_press_event', on_key)
     
-    # Initial instructions
-    print("\n" + "="*50)
-    print("INTEGRATED PLANNER SIMULATION")
-    print("="*50)
-    print("Controls:")
-    print("  's' - Start/Stop simulation")
-    print("  'r' - Reset simulation")
-    print("  'q' - Quit")
-    print("\nPress 's' to start the simulation...")
-    print("="*50 + "\n")
+    print("\n🚀 READY TO START!")
+    print("Controls: [S] Start/Stop  [P] Pause/Resume  [R] Reset  [Q] Quit")
+    print("-" * 70)
     
-    # Create animation
     ani = FuncAnimation(fig, update, frames=Config.SIM_TIME, interval=50, blit=False)
     plt.tight_layout()
     plt.show()
 
+# ==========================================
+# 7. RUN THE SIMULATION
+# ==========================================
 if __name__ == "__main__":
     run_simulation()

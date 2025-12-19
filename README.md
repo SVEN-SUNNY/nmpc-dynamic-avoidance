@@ -224,22 +224,7 @@ Considers physical limitations
 
 Adapts to changing situations
 
-Visualization Components
-What You See on Screen
-Main Map (Left)
 
-╔═══════════════════════════════════════╗
-║  • Black areas: Static obstacles      ║
-║  • Green line: Planned path           ║
-║  • Green dots: Waypoints              ║
-║  • Green rectangle: Robot             ║
-║  • Orange circles: Moving obstacles   ║
-║  • Red trails: Where obstacles moved  ║
-║  • Blue dot: Current target point     ║
-║  • Magenta dot: Alternative target    ║
-║  • Yellow line: Predicted trajectory  ║
-║  • Circles around robot: Safety zones ║
-╚═══════════════════════════════════════╝
 Costmap (Top Right)
 A heat map showing:
 

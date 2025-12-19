@@ -47,7 +47,7 @@ class Config:
     COSTMAP_PATH_DEVIATION_PENALTY = 50.0  # Penalty for deviating
     
     # DYNAMIC MODEL PARAMETERS
-    MASS = 1.5
+    MASS = 15.0
     INERTIA = 0.15
     MAX_FORCE = 4.0
     MAX_TORQUE = 2.5
@@ -2082,3 +2082,4 @@ def run_simulation():
 # ==========================================
 if __name__ == "__main__":
     run_simulation()
+
